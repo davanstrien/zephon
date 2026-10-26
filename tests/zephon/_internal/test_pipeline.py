@@ -3,7 +3,7 @@
 import gc
 import pickle
 from collections.abc import Generator, Iterator
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock
 from weakref import WeakSet, ref
 
 import pytest
@@ -206,3 +206,22 @@ def test_controls_do_not_notify_delivery_or_escape_the_tail(use_monotone: bool) 
     finally:
         # Leave end-of-stream cleanup to integration tests.
         iterator.close()
+
+
+def test_completed_mtp_stream_supersedes_checkpoint_destination_engine(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pipe = Pipeline(FakeIndexableWorkSource(make_inmem_dataset("tiny", [{"x": 1}])))
+    destination_engine = pipe._engine = Mock()
+    terminal_state = {"terminal": True}
+    child = MagicMock(_closed=False)
+    child.__iter__.return_value = iter(())
+    child.checkpoint.return_value = terminal_state
+    monkeypatch.setattr("zephon._internal.mtp.MTPPipeline", Mock(return_value=child))
+
+    assert list(pipe._iter_mtp()) == []
+    destination_engine.close.assert_called_once_with()
+    child.checkpoint.assert_called_once_with(local=True)
+    child.close.assert_called_once_with()
+    assert pipe._engine is None and pipe._sp is None
+    assert pipe._last_local_state is terminal_state

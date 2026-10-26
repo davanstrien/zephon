@@ -21,6 +21,8 @@ from zephon._internal.mtp import (
     _ACK,
     _CHECKPOINT,
     _CHECKPOINT_ERROR,
+    _LOCAL_CHECKPOINT,
+    _STATE_DICT,
     MTPPipeline,
     _handle_ctrl_msg,
     _lower_thread_priority,
@@ -31,6 +33,22 @@ from zephon._internal.mtp import (
 from zephon._internal.notify import _ContributorNotify, _MonotoneNotify
 from zephon._internal.runners.queue import NamedQueue, QueueFeederError
 from zephon.types import ContributorRef, SampleBatch, SampleCursor, SampleRecord
+
+
+@pytest.mark.parametrize("tag", [_LOCAL_CHECKPOINT, _CHECKPOINT])
+def test_checkpoint_control_aggregates_only_on_explicit_request(tag: int) -> None:
+    engine, connection = mock.Mock(), mock.Mock()
+    local = engine._state_dict_local.return_value = {"local": True}
+    merged = engine.state_dict.return_value = {"merged": True}
+    assert not _handle_ctrl_msg(tag, None, {}, engine, connection)
+    if tag == _LOCAL_CHECKPOINT:
+        engine._state_dict_local.assert_called_once_with()
+        engine.state_dict.assert_not_called()
+        connection.send.assert_called_once_with((_STATE_DICT, local))
+    else:
+        engine.state_dict.assert_called_once_with()
+        engine._state_dict_local.assert_not_called()
+        connection.send.assert_called_once_with((_STATE_DICT, merged))
 
 
 @pytest.mark.parametrize("use_monotone", [True, False])
