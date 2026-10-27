@@ -41,6 +41,12 @@ split the input sample into any number of output records that will each be at mo
 :caption: examples/guide/pipelines/tokenize_max_length.py
 ```
 
+When `tokenizers>=1` is installed, `tokenize` loads the folder's `tokenizer.json` with that
+much faster engine instead of `AutoTokenizer`, and returns the same token ids as int64 NumPy
+arrays. That path needs a local folder or cloud URI as `tokenizer_id`, the default `use_fast`,
+and a `special_tokens` mode other than `"tokenizer_default"`; anything else raises an error
+instead of falling back. Passing a pre-built `tokenizer` skips loading either way.
+
 If the underlying data format you are reading from returns text as bytes instead of as a
 Python string, you can insert a `decode_text` operation in order to handle converting the
 raw bytes into a string prior to tokenization:

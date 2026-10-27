@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, ClassVar
 import cloudpickle
 import numpy as np
 
-from zephon._internal.utils.tokenizer import load_hf_tokenizer
+from zephon._internal.utils.tokenizer import TokenizerLoader, load_hf_tokenizer
 from zephon.ops.config import MissingFieldMode
 
 if TYPE_CHECKING:
@@ -229,6 +229,8 @@ class TextTokenCountingSpec(TokenCountingSpec):
     split_long_samples: bool = False
     special_tokens: str = "bos_eos"
     use_fast: bool | None = True
+    # Without an op (default calibration), HF's loader serves the fallback stub.
+    load_tokenizer: TokenizerLoader = load_hf_tokenizer
 
     @classmethod
     def from_op(cls, op: "TokenizeText") -> "TextTokenCountingSpec":
@@ -250,6 +252,7 @@ class TextTokenCountingSpec(TokenCountingSpec):
             split_long_samples=op.split_long_samples,
             special_tokens=op.special_tokens,
             use_fast=op.use_fast,
+            load_tokenizer=op.load_tokenizer,
         )
 
     @property
@@ -280,7 +283,7 @@ class TextTokenCountingSpec(TokenCountingSpec):
     def build_counter(self) -> DeliveredTokenCounter:
         tokenizer = self.tokenizer
         if tokenizer is None:
-            tokenizer = load_hf_tokenizer(self.tokenizer_id, use_fast=self.use_fast)
+            tokenizer = self.load_tokenizer(self.tokenizer_id, use_fast=self.use_fast)
         return _TextCounter(tokenizer, self)
 
 

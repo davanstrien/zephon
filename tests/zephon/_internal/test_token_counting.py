@@ -234,15 +234,16 @@ def test_build_counter_falls_back_without_model(tokenizer_id):
     assert counter.tokenizer.bos_token_id == 1  # the in-process fallback stub
 
 
-def test_build_counter_delegates_to_shared_loader(monkeypatch):
+def test_build_counter_delegates_to_its_loader():
     calls: list[tuple[str | None, bool | None]] = []
 
     def fake_load(tokenizer_id, *, use_fast):
         calls.append((tokenizer_id, use_fast))
         return fallback_tokenizer()
 
-    monkeypatch.setattr("zephon._internal.token_counting.load_hf_tokenizer", fake_load)
-    TextTokenCountingSpec(tokenizer_id="hf-model", use_fast=False).build_counter()
+    TextTokenCountingSpec(
+        tokenizer_id="hf-model", use_fast=False, load_tokenizer=fake_load
+    ).build_counter()
     assert calls == [("hf-model", False)]
 
 

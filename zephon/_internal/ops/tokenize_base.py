@@ -70,11 +70,7 @@ class TokenizeBase(BaseOp):
                 return
 
             if self.tok is None:
-                self.tok = load_hf_tokenizer(
-                    self.tokenizer_id,
-                    use_fast=self.use_fast,
-                    eos_token=self.eos_token,
-                )
+                self.tok = self._load_tokenizer()
 
             try:
                 self._finalize_setup()
@@ -82,6 +78,11 @@ class TokenizeBase(BaseOp):
                 self._setup_error = exc
                 raise
             self._tokenizer_instantiated = True
+
+    def _load_tokenizer(self) -> TokenizerLike:
+        return load_hf_tokenizer(
+            self.tokenizer_id, use_fast=self.use_fast, eos_token=self.eos_token
+        )
 
     def _finalize_setup(self) -> None:
         """Post-load, per-op configuration; failures are cached and re-raised."""

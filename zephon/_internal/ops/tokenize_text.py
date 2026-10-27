@@ -23,9 +23,12 @@ from typing import (
 from zephon._internal.ops.tokenize_base import _MISSING, TokenizeBase
 from zephon._internal.token_counting import TextTokenCountingSpec
 from zephon._internal.utils.tokenizer import (
+    Refused,
     TokenBatch,
     TokenizerLike,
     TokenizerOutput,
+    installed_tokenizer_loader,
+    load_v1_tokenizer,
 )
 from zephon._internal.utils.torch_compat import (
     _TENSOR_ITER_LOCK,
@@ -92,6 +95,11 @@ class TokenizeText(TokenizeBase):
                 ``tokenizer_id``.
             tokenizer_id: HF model id passed to ``AutoTokenizer.from_pretrained``.
                 ``"__fallback__"`` selects a small in-process stub for tests.
+                With ``tokenizers>=1`` installed, the folder's ``tokenizer.json``
+                is loaded with that faster engine instead, which emits the same
+                ids as int64 numpy arrays; it needs a local or cloud folder, the
+                default ``use_fast`` and a mode other than
+                ``"tokenizer_default"``, and raises here otherwise.
             field: Dot-separated payload path of the text to tokenize.
             missing_field: How to handle mapping payloads where ``field`` cannot be
                 resolved. ``"error"`` (default) raises before tokenization;
@@ -178,6 +186,23 @@ class TokenizeText(TokenizeBase):
                 + f"got {special_tokens!r}"
             )
 
+        load_tokenizer = installed_tokenizer_loader()
+        if tokenizer is None and load_tokenizer is load_v1_tokenizer:
+            unsupported = {
+                "tokenizer_id=None": tokenizer_id is None,
+                f"use_fast={use_fast!r}": use_fast is not True,
+                "special_tokens='tokenizer_default'": (
+                    special_tokens == "tokenizer_default"
+                ),
+            }
+            named = [name for name, bad in unsupported.items() if bad]
+            if named:
+                raise Refused(
+                    f"with tokenizers>=1 installed, tokenize does not support "
+                    + f"{', '.join(named)}: it loads tokenizer_id's tokenizer.json "
+                    + "itself and emits content ids only; pass a tokenizer instead"
+                )
+
         if missing_field not in _VALID_MISSING_FIELD_MODES:
             raise ValueError(
                 f"missing_field must be one of {_VALID_MISSING_FIELD_MODES}, "
@@ -243,6 +268,7 @@ class TokenizeText(TokenizeBase):
             max_batch=max_batch,
             max_latency_ms=max_latency_ms,
         )
+        self.load_tokenizer = load_tokenizer
         self.field = field
         self.missing_field: MissingFieldMode = missing_field
         self._field_path: tuple[str, ...] = tuple(field.split(".")) if field else ()
@@ -318,6 +344,9 @@ class TokenizeText(TokenizeBase):
                 self._cached_kwargs["return_tensors"] = "np"
             else:
                 self._cached_kwargs["return_tensors"] = self.return_tensors
+
+    def _load_tokenizer(self) -> TokenizerLike:
+        return self.load_tokenizer(self.tokenizer_id, use_fast=self.use_fast)
 
     def _finalize_setup(self) -> None:
         # _ensure_padding_token may set pad_token=eos_token (the HF pattern

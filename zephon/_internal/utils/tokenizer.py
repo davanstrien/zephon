@@ -7,8 +7,9 @@ Defines the minimal :class:`TokenizerLike` interface (a structural subset of a
 Hugging Face tokenizer), the batch/output type aliases,
 :func:`fallback_tokenizer` — a deterministic, dependency-free reference
 implementation used when no tokenizer is configured and throughout the tests —
-and :func:`load_hf_tokenizer`, the retrying HF loader shared by the tokenize
-ops.
+the two loaders (:func:`load_hf_tokenizer`, :func:`load_v1_tokenizer`), and
+:func:`installed_tokenizer_loader`, which picks between them by the installed
+``tokenizers`` version.
 
 Chat helpers select assistant messages, map generated ranges to token masks,
 and isolate HF's compiled-template caches between threads.
@@ -16,12 +17,16 @@ and isolate HF's compiled-template caches between threads.
 
 from __future__ import annotations
 
+import importlib.metadata
+import json
 import sys
 import threading
 import traceback
+from pathlib import Path
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Mapping,
     Protocol,
     Sequence,
@@ -55,6 +60,7 @@ TokenBatch: TypeAlias = Union[
     Sequence[Sequence[int]],
 ]
 TokenizerOutput: TypeAlias = Mapping[str, TokenBatch]
+TokenizerLoader: TypeAlias = Callable[..., "TokenizerLike"]
 
 
 class TokenizerLike(Protocol):
@@ -332,10 +338,152 @@ def load_hf_tokenizer(
         raise
 
 
+class Refused(ValueError):
+    """A request the tokenizers>=1 path cannot serve exactly."""
+
+
+class V1Tokenizer:
+    """``TokenizerLike`` over a tokenizers 1.x ``Tokenizer``.
+
+    Emits content ids only, as int64 numpy arrays, identical to the HF fast
+    tokenizer's: special-token templates, padding and left truncation are
+    refused rather than approximated. Special-token strings come from
+    ``tokenizer_config.json`` and ``special_tokens_map.json`` (refused where
+    they disagree, since HF's precedence between them is not replicated) and
+    their ids from ``tokenizer.json``, as HF derives them.
+    """
+
+    def __init__(self, local_dir: str) -> None:
+        from tokenizers import Tokenizer
+
+        root = Path(local_dir)
+        spec = json.loads((root / "tokenizer.json").read_text(encoding="utf-8"))
+        vocab = spec["model"].get("vocab")
+        self._ids: dict[str, int] = {
+            **(vocab if isinstance(vocab, dict) else {}),
+            **{t["content"]: t["id"] for t in spec["added_tokens"]},
+        }
+        sources = {
+            name: json.loads((root / name).read_text(encoding="utf-8"))
+            for name in ("tokenizer_config.json", "special_tokens_map.json")
+            if (root / name).exists()
+        }
+        special: dict[str, str | None] = {}
+        for key in ("bos_token", "eos_token", "pad_token"):
+            # HF stores a token as a plain string or an AddedToken dict.
+            values = {
+                name: v["content"] if isinstance(v, dict) else v
+                for name, source in sources.items()
+                if (v := source.get(key)) is not None
+            }
+            if len(set(values.values())) > 1:
+                raise Refused(f"{key} differs between files: {values}")
+            special[key] = next(iter(values.values()), None)
+        bos, eos, pad = special.values()
+        self.bos_token: str | None = bos
+        self.eos_token: int | str | None = eos
+        self.pad_token: int | str | None = pad
+        self.name_or_path: str | None = local_dir
+        self._tokenizer = Tokenizer.from_file(str(root / "tokenizer.json"))
+
+    def _id(self, token: int | str | None) -> int | None:
+        return None if token is None else self._ids[str(token)]
+
+    @property
+    def bos_token_id(self) -> int | None:
+        return self._id(self.bos_token)
+
+    @property
+    def eos_token_id(self) -> int | None:
+        return self._id(self.eos_token)
+
+    @property
+    def pad_token_id(self) -> int | None:
+        return self._id(self.pad_token)
+
+    def __reduce__(self) -> tuple[type[V1Tokenizer], tuple[str | None]]:
+        # A tokenizers Tokenizer is not picklable; rebuild from the directory.
+        return (V1Tokenizer, (self.name_or_path,))
+
+    def __call__(self, texts: Sequence[str] | str, **kwargs: Any) -> TokenizerOutput:
+        import numpy as np
+
+        truncation = kwargs.pop("truncation", False)
+        max_length = kwargs.pop("max_length", None)
+        refused = {
+            k: v
+            for k, v in kwargs.items()
+            if k not in _V1_ACCEPTED_KWARGS or _V1_ACCEPTED_KWARGS[k] != v
+        }
+        if truncation and max_length is None:
+            refused["truncation"] = "without max_length"
+        if refused:
+            raise Refused(f"the tokenizers>=1 path does not support {refused}")
+
+        single = isinstance(texts, str)
+        batch = [texts] if single else list(texts)
+        nulls = sum(t is None for t in batch)
+        if nulls:
+            raise TypeError(f"cannot tokenize None: {nulls} null text(s)")
+        # One encode per text: encode_batch spreads over every core regardless of
+        # RAYON_NUM_THREADS. padding/truncation=None override tokenizer.json's.
+        encodings = [
+            self._tokenizer.encode(
+                t, add_special_tokens=False, padding=None, truncation=None
+            )
+            for t in batch
+        ]
+        end = max_length if truncation else None
+        docs = [e.ids_array[:end].astype(np.int64) for e in encodings]
+        return {"input_ids": docs[0] if single else docs}
+
+
+_V1_ACCEPTED_KWARGS: dict[str, Any] = {
+    "add_special_tokens": False,
+    "padding": False,
+    "return_tensors": None,
+    "truncation_side": "right",
+}
+
+
+def load_v1_tokenizer(
+    tokenizer_id: str | None,
+    *,
+    use_fast: bool | None = True,
+    eos_token: str | None = None,
+) -> TokenizerLike:
+    """Load a :class:`V1Tokenizer` from a local directory or cloud URI."""
+    # Only TokenizeText routes here, and it refuses anything else at __init__.
+    assert use_fast is True and eos_token is None
+    suppress_library_threads()
+
+    from zephon._internal.utils.tokenizer_cloud import resolve_tokenizer_id_with_retry
+
+    return V1Tokenizer(cast(str, resolve_tokenizer_id_with_retry(tokenizer_id)))
+
+
+def installed_tokenizer_loader() -> TokenizerLoader:
+    """The v1 loader when tokenizers>=1 is installed, else the HF loader.
+
+    Read from package metadata so the driver never imports the native library
+    before workers fork.
+    """
+    try:
+        version = importlib.metadata.version("tokenizers")
+    except importlib.metadata.PackageNotFoundError:
+        return load_hf_tokenizer
+    return load_v1_tokenizer if int(version.split(".")[0]) >= 1 else load_hf_tokenizer
+
+
 __all__ = [
+    "Refused",
     "TokenBatch",
     "TokenizerLike",
+    "TokenizerLoader",
     "TokenizerOutput",
+    "V1Tokenizer",
     "fallback_tokenizer",
+    "installed_tokenizer_loader",
     "load_hf_tokenizer",
+    "load_v1_tokenizer",
 ]
