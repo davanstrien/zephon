@@ -23,6 +23,8 @@ Auth: bearer token from ``huggingface_hub.get_token()`` (``HF_TOKEN``, then the
 
 from __future__ import annotations
 
+import functools
+import importlib.util
 import logging
 import os
 import posixpath
@@ -67,11 +69,34 @@ _sizes: dict[str, int] = {}
 # One lock per in-flight resolution or listing, so concurrent misses on the
 # same key wait for one result instead of repeating the Hub requests.
 _key_locks: dict[tuple[str, ...], threading.Lock] = {}
+# One HfFileSystem per token, so every thread reuses its directory listings.
+_hffs: dict[str | None, Any] = {}
 
 
 def _key_lock(key: tuple[str | bool | None, ...]) -> threading.Lock:
     with _memo_lock:
         return _key_locks.setdefault(tuple(str(part) for part in key), threading.Lock())
+
+
+@functools.cache
+def _xet_downloads_supported() -> bool:
+    """Whether ``HfFileSystem.get_file`` downloads Xet files with ``hf_xet``.
+
+    huggingface_hub 2.1 added that path; before it, ``get_file`` calls
+    ``http_get`` without resume, so the older path here is better.
+    """
+    try:
+        import huggingface_hub
+        from huggingface_hub import constants
+    except ImportError:
+        return False
+    try:
+        major, minor = (int(p) for p in huggingface_hub.__version__.split(".")[:2])
+    except ValueError:
+        return False
+    if (major, minor) < (2, 1) or constants.HF_HUB_DISABLE_XET:
+        return False
+    return importlib.util.find_spec("hf_xet") is not None
 
 
 # The Hub's paths-info endpoint accepts at most 100 paths per request.
@@ -499,6 +524,11 @@ class HFBackend(OpenViaDownloadMixin):
         del timeout
 
         parts, name, url = self._resolve_file(src)
+        xet_rpath = self._xet_rpath(parts, name)
+        if xet_rpath is not None:
+            self._download_xet(xet_rpath, src, dst)
+            return
+
         expected_size = self._size(parts, name, url)
         if expected_size is None:
             raise FileNotFoundError(f"No such hf:// file: {src}")
@@ -553,6 +583,64 @@ class HFBackend(OpenViaDownloadMixin):
             # caller-driven retry can resume from the current offset.
             raise
 
+        os.replace(incomplete, dst)
+
+    def _xet_rpath(self, parts: HFUriParts, name: str) -> str | None:
+        """Return the ``HfFileSystem`` path of a Xet-backed file, else ``None``.
+
+        ``None`` means ``download`` uses ``http_get``: huggingface_hub < 2.1
+        (whose ``get_file`` cannot resume), no ``hf_xet``, a file not stored
+        on Xet, or a lookup error that the ``http_get`` path reports properly.
+        """
+        if not _xet_downloads_supported():
+            return None
+        rpath = (
+            f"datasets/{parts.repo_id}@{parts.revision}/{urllib.parse.unquote(name)}"
+        )
+        try:
+            info = self._get_hffs().info(rpath)
+        except Exception:
+            return None
+        return rpath if info.get("xet_hash") else None
+
+    def _get_hffs(self) -> Any:
+        """Return a process-wide ``HfFileSystem``, so threads share its listings."""
+        token = self._get_token()
+        with _memo_lock:
+            fs = _hffs.get(token)
+            if fs is None:
+                from huggingface_hub import HfFileSystem
+
+                fs = _hffs[token] = HfFileSystem(token=token)
+        return fs
+
+    def _download_xet(self, rpath: str, src: str, dst: str) -> None:
+        """Download a Xet-backed file with ``hf_xet``.
+
+        An interrupted download restarts: a partial ``hf_xet`` file has no
+        hash to check it against.
+        """
+        from huggingface_hub.utils import HfHubHTTPError
+
+        os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+        incomplete = dst + _INCOMPLETE_SUFFIX
+        self._unlink_quiet(incomplete)
+        try:
+            self._get_hffs().get_file(rpath, incomplete)
+        except HfHubHTTPError as exc:
+            self._unlink_quiet(incomplete)
+            status = getattr(getattr(exc, "response", None), "status_code", None)
+            if status == 404:
+                raise FileNotFoundError(f"No such hf:// file: {src}") from exc
+            if status in (401, 403):
+                raise PermissionError(
+                    f"hf:// access denied: {src}; "
+                    "set HF_TOKEN or run `huggingface-cli login`."
+                ) from exc
+            raise
+        except BaseException:
+            self._unlink_quiet(incomplete)
+            raise
         os.replace(incomplete, dst)
 
     @staticmethod
