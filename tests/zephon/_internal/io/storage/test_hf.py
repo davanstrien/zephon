@@ -671,11 +671,12 @@ class TestXetDownload:
             HFBackend().download(f"{FROZEN_ORIGINAL}/{self._NAME}", str(dst))
         assert list(tmp_path.iterdir()) == []
 
-    def test_concurrent_download_never_publishes_partial_file(
+    def test_size_check_rejects_file_replaced_mid_download(
         self, tmp_path: Path
     ) -> None:
-        # Force the bad interleaving: A pauses mid-download, B restarts the
-        # shared ``.incomplete``, and A finishes while B's file is partial.
+        # A pauses mid-download, B restarts the shared ``.incomplete``, and A
+        # finishes while B's file is partial: A's size check must reject it.
+        # (Concurrent calls are not safe in general; the cache manager locks.)
         fs = _FakeHfFileSystem({"size": 11, "xet_hash": "abc"})
         a_paused = threading.Event()
         b_written = threading.Event()
@@ -713,8 +714,12 @@ class TestXetDownload:
         b_thread.start()
         a_thread.join(10)
         b_thread.join(10)
+        assert not a_thread.is_alive() and not b_thread.is_alive()
 
         assert "expected 11" in str(errors["a"])
+        # B's file was removed by A, so B fails too, but not as a missing file.
+        assert isinstance(errors["b"], OSError)
+        assert not isinstance(errors["b"], FileNotFoundError)
         assert not dst.exists() or dst.read_bytes() == b"hello world"
 
     def test_failed_download_removes_incomplete(self, tmp_path: Path) -> None:

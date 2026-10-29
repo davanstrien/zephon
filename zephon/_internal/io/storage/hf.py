@@ -88,6 +88,8 @@ def _xet_downloads_supported() -> bool:
     try:
         import huggingface_hub
         from huggingface_hub import constants
+
+        # packaging is a huggingface_hub dependency.
         from packaging.version import InvalidVersion, Version
     except ImportError:
         return False
@@ -627,9 +629,9 @@ class HFBackend(OpenViaDownloadMixin):
         """Download a Xet-backed file with ``hf_xet``.
 
         An interrupted download restarts: a partial ``hf_xet`` file has no
-        hash to check it against. The size check means a concurrent call for
-        the same ``dst`` makes this call fail rather than publish its partial
-        file; the cache manager's shard lock keeps that from happening there.
+        hash to check it against. As with the ``http_get`` path, concurrent
+        calls for the same ``dst`` are not safe; the cache manager serialises
+        them with its per-shard lock.
         """
         from huggingface_hub.utils import HfHubHTTPError
 
@@ -652,7 +654,12 @@ class HFBackend(OpenViaDownloadMixin):
         except BaseException:
             self._unlink_quiet(incomplete)
             raise
-        got = os.path.getsize(incomplete)
+        try:
+            got = os.path.getsize(incomplete)
+        except OSError as exc:
+            # Something removed the file during the download; this is not a
+            # missing hf:// file, so don't raise FileNotFoundError.
+            raise OSError(f"hf:// download of {src} was interrupted") from exc
         if got != size:
             self._unlink_quiet(incomplete)
             raise OSError(f"hf:// download of {src} wrote {got} bytes, expected {size}")
