@@ -671,40 +671,51 @@ class TestXetDownload:
             HFBackend().download(f"{FROZEN_ORIGINAL}/{self._NAME}", str(dst))
         assert list(tmp_path.iterdir()) == []
 
-    def test_concurrent_downloads_of_one_dst_do_not_mix(self, tmp_path: Path) -> None:
+    def test_concurrent_download_never_publishes_partial_file(
+        self, tmp_path: Path
+    ) -> None:
+        # Force the bad interleaving: A pauses mid-download, B restarts the
+        # shared ``.incomplete``, and A finishes while B's file is partial.
         fs = _FakeHfFileSystem({"size": 11, "xet_hash": "abc"})
-        both_started = threading.Barrier(2, timeout=10)
-        lpaths: list[str] = []
+        a_paused = threading.Event()
+        b_written = threading.Event()
+        calls: list[str] = []
 
-        def two_halves(rpath: str, lpath: str) -> None:
-            lpaths.append(lpath)
+        def get_file(rpath: str, lpath: str) -> None:
+            calls.append(lpath)
             with open(lpath, "ab") as fh:
                 fh.write(b"hello")
                 fh.flush()
-                both_started.wait()
-                fh.write(b" world")
+                if len(calls) == 1:
+                    a_paused.set()
+                    assert b_written.wait(10)
+                    fh.write(b" world")
+                else:
+                    b_written.set()
+                    a_thread.join(10)
+                    fh.write(b" world")
 
-        fs.get_file = two_halves  # type: ignore[method-assign]
+        fs.get_file = get_file  # type: ignore[method-assign]
         self._use_fs(fs)
         dst = tmp_path / "out.parquet"
-        errors: list[BaseException] = []
+        errors: dict[str, BaseException] = {}
 
-        def run() -> None:
+        def run(name: str) -> None:
             try:
                 HFBackend().download(f"{FROZEN_ORIGINAL}/{self._NAME}", str(dst))
             except BaseException as exc:
-                errors.append(exc)
+                errors[name] = exc
 
-        threads = [threading.Thread(target=run) for _ in range(2)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        a_thread = threading.Thread(target=run, args=("a",))
+        b_thread = threading.Thread(target=run, args=("b",))
+        a_thread.start()
+        assert a_paused.wait(10)
+        b_thread.start()
+        a_thread.join(10)
+        b_thread.join(10)
 
-        assert errors == []
-        assert len(set(lpaths)) == 2
-        assert dst.read_bytes() == b"hello world"
-        assert sorted(p.name for p in tmp_path.iterdir()) == ["out.parquet"]
+        assert "expected 11" in str(errors["a"])
+        assert not dst.exists() or dst.read_bytes() == b"hello world"
 
     def test_failed_download_removes_incomplete(self, tmp_path: Path) -> None:
         fs = _FakeHfFileSystem({"size": 11, "xet_hash": "abc"})

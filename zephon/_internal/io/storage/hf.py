@@ -28,7 +28,6 @@ import importlib.util
 import logging
 import os
 import posixpath
-import tempfile
 import threading
 import urllib.parse
 from collections.abc import Iterable, Iterator, Sequence
@@ -628,18 +627,15 @@ class HFBackend(OpenViaDownloadMixin):
         """Download a Xet-backed file with ``hf_xet``.
 
         An interrupted download restarts: a partial ``hf_xet`` file has no
-        hash to check it against. Each call writes to its own temporary file
-        next to ``dst``, so concurrent calls for the same ``dst`` cannot
-        publish each other's partial data.
+        hash to check it against. The size check means a concurrent call for
+        the same ``dst`` makes this call fail rather than publish its partial
+        file; the cache manager's shard lock keeps that from happening there.
         """
         from huggingface_hub.utils import HfHubHTTPError
 
-        dst_dir = os.path.dirname(dst) or "."
-        os.makedirs(dst_dir, exist_ok=True)
-        fd, incomplete = tempfile.mkstemp(
-            dir=dst_dir, prefix=".xet-", suffix=_INCOMPLETE_SUFFIX
-        )
-        os.close(fd)
+        os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
+        incomplete = dst + _INCOMPLETE_SUFFIX
+        self._unlink_quiet(incomplete)
         try:
             self._get_hffs().get_file(rpath, incomplete)
         except HfHubHTTPError as exc:
