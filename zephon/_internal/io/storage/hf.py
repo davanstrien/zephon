@@ -28,6 +28,7 @@ import importlib.util
 import logging
 import os
 import posixpath
+import tempfile
 import threading
 import urllib.parse
 from collections.abc import Iterable, Iterator, Sequence
@@ -88,13 +89,16 @@ def _xet_downloads_supported() -> bool:
     try:
         import huggingface_hub
         from huggingface_hub import constants
+        from packaging.version import InvalidVersion, Version
     except ImportError:
         return False
     try:
-        major, minor = (int(p) for p in huggingface_hub.__version__.split(".")[:2])
-    except ValueError:
+        # Pre-releases such as 2.1.0rc1 sort before 2.1.0 and are excluded.
+        if Version(huggingface_hub.__version__) < Version("2.1.0"):
+            return False
+    except InvalidVersion:
         return False
-    if (major, minor) < (2, 1) or constants.HF_HUB_DISABLE_XET:
+    if constants.HF_HUB_DISABLE_XET:
         return False
     return importlib.util.find_spec("hf_xet") is not None
 
@@ -524,9 +528,9 @@ class HFBackend(OpenViaDownloadMixin):
         del timeout
 
         parts, name, url = self._resolve_file(src)
-        xet_rpath = self._xet_rpath(parts, name)
-        if xet_rpath is not None:
-            self._download_xet(xet_rpath, src, dst)
+        xet_file = self._xet_file(parts, name)
+        if xet_file is not None:
+            self._download_xet(*xet_file, src, dst)
             return
 
         expected_size = self._size(parts, name, url)
@@ -585,8 +589,8 @@ class HFBackend(OpenViaDownloadMixin):
 
         os.replace(incomplete, dst)
 
-    def _xet_rpath(self, parts: HFUriParts, name: str) -> str | None:
-        """Return the ``HfFileSystem`` path of a Xet-backed file, else ``None``.
+    def _xet_file(self, parts: HFUriParts, name: str) -> tuple[str, int] | None:
+        """Return the ``HfFileSystem`` path and size of a Xet-backed file.
 
         ``None`` means ``download`` uses ``http_get``: huggingface_hub < 2.1
         (whose ``get_file`` cannot resume), no ``hf_xet``, a file not stored
@@ -597,11 +601,17 @@ class HFBackend(OpenViaDownloadMixin):
         rpath = (
             f"datasets/{parts.repo_id}@{parts.revision}/{urllib.parse.unquote(name)}"
         )
+        # The first lookup in a directory lists it; the lock makes concurrent
+        # first lookups wait for that listing instead of repeating it.
         try:
-            info = self._get_hffs().info(rpath)
+            with _key_lock(("xet-info", posixpath.dirname(rpath))):
+                info = self._get_hffs().info(rpath)
         except Exception:
             return None
-        return rpath if info.get("xet_hash") else None
+        size = info.get("size")
+        if not info.get("xet_hash") or not isinstance(size, int):
+            return None
+        return rpath, size
 
     def _get_hffs(self) -> Any:
         """Return a process-wide ``HfFileSystem``, so threads share its listings."""
@@ -614,17 +624,22 @@ class HFBackend(OpenViaDownloadMixin):
                 fs = _hffs[token] = HfFileSystem(token=token)
         return fs
 
-    def _download_xet(self, rpath: str, src: str, dst: str) -> None:
+    def _download_xet(self, rpath: str, size: int, src: str, dst: str) -> None:
         """Download a Xet-backed file with ``hf_xet``.
 
         An interrupted download restarts: a partial ``hf_xet`` file has no
-        hash to check it against.
+        hash to check it against. Each call writes to its own temporary file
+        next to ``dst``, so concurrent calls for the same ``dst`` cannot
+        publish each other's partial data.
         """
         from huggingface_hub.utils import HfHubHTTPError
 
-        os.makedirs(os.path.dirname(dst) or ".", exist_ok=True)
-        incomplete = dst + _INCOMPLETE_SUFFIX
-        self._unlink_quiet(incomplete)
+        dst_dir = os.path.dirname(dst) or "."
+        os.makedirs(dst_dir, exist_ok=True)
+        fd, incomplete = tempfile.mkstemp(
+            dir=dst_dir, prefix=".xet-", suffix=_INCOMPLETE_SUFFIX
+        )
+        os.close(fd)
         try:
             self._get_hffs().get_file(rpath, incomplete)
         except HfHubHTTPError as exc:
@@ -641,6 +656,10 @@ class HFBackend(OpenViaDownloadMixin):
         except BaseException:
             self._unlink_quiet(incomplete)
             raise
+        got = os.path.getsize(incomplete)
+        if got != size:
+            self._unlink_quiet(incomplete)
+            raise OSError(f"hf:// download of {src} wrote {got} bytes, expected {size}")
         os.replace(incomplete, dst)
 
     @staticmethod

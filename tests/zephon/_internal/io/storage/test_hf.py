@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import importlib.util
 import logging
+import threading
 from collections.abc import Callable, Iterator, Mapping
 from pathlib import Path
 from typing import Any
@@ -620,7 +621,9 @@ class _FakeHfFileSystem:
 
     def get_file(self, rpath: str, lpath: str) -> None:
         self.fetched.append(rpath)
-        Path(lpath).write_bytes(self._payload)
+        # Append, so leftover bytes in ``lpath`` would show up in the result.
+        with open(lpath, "ab") as fh:
+            fh.write(self._payload)
 
 
 @requires_hf_hub
@@ -649,14 +652,59 @@ class TestXetDownload:
         assert fs.fetched == [self._RPATH]
         assert http.urls() == []  # no resolve/ HEAD
         assert http_get.call_count == 0
-        assert not (tmp_path / "out.parquet.incomplete").exists()
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["out.parquet"]
 
     def test_restarts_instead_of_resuming(self, tmp_path: Path) -> None:
-        self._use_fs(_FakeHfFileSystem({"size": 11, "xet_hash": "abc"}))
         dst = tmp_path / "out.parquet"
         (tmp_path / "out.parquet.incomplete").write_bytes(b"stale")
+        (tmp_path / ".xet-old.incomplete").write_bytes(b"stale")
+        fs = _FakeHfFileSystem({"size": 11, "xet_hash": "abc"})
+        self._use_fs(fs)
         HFBackend().download(f"{FROZEN_ORIGINAL}/{self._NAME}", str(dst))
         assert dst.read_bytes() == b"hello world"
+        assert fs.fetched == [self._RPATH]
+
+    def test_wrong_size_is_not_published(self, tmp_path: Path) -> None:
+        self._use_fs(_FakeHfFileSystem({"size": 11, "xet_hash": "abc"}, b"hello"))
+        dst = tmp_path / "out.parquet"
+        with pytest.raises(OSError, match="wrote 5 bytes, expected 11"):
+            HFBackend().download(f"{FROZEN_ORIGINAL}/{self._NAME}", str(dst))
+        assert list(tmp_path.iterdir()) == []
+
+    def test_concurrent_downloads_of_one_dst_do_not_mix(self, tmp_path: Path) -> None:
+        fs = _FakeHfFileSystem({"size": 11, "xet_hash": "abc"})
+        both_started = threading.Barrier(2, timeout=10)
+        lpaths: list[str] = []
+
+        def two_halves(rpath: str, lpath: str) -> None:
+            lpaths.append(lpath)
+            with open(lpath, "ab") as fh:
+                fh.write(b"hello")
+                fh.flush()
+                both_started.wait()
+                fh.write(b" world")
+
+        fs.get_file = two_halves  # type: ignore[method-assign]
+        self._use_fs(fs)
+        dst = tmp_path / "out.parquet"
+        errors: list[BaseException] = []
+
+        def run() -> None:
+            try:
+                HFBackend().download(f"{FROZEN_ORIGINAL}/{self._NAME}", str(dst))
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=run) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        assert errors == []
+        assert len(set(lpaths)) == 2
+        assert dst.read_bytes() == b"hello world"
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["out.parquet"]
 
     def test_failed_download_removes_incomplete(self, tmp_path: Path) -> None:
         fs = _FakeHfFileSystem({"size": 11, "xet_hash": "abc"})
@@ -671,12 +719,34 @@ class TestXetDownload:
             HFBackend().download(
                 f"{FROZEN_ORIGINAL}/{self._NAME}", str(tmp_path / "out.parquet")
             )
-        assert not (tmp_path / "out.parquet.incomplete").exists()
+        assert list(tmp_path.iterdir()) == []
 
     def test_non_xet_file_falls_back_to_http_get(
         self, http: _FakeHTTP, tmp_path: Path
     ) -> None:
         fs = _FakeHfFileSystem({"size": 11, "xet_hash": None})
+        self._use_fs(fs)
+        url = f"{_RESOLVE}/{SOURCE}/data/a.parquet"
+        http.on("HEAD", url, _Resp(302, headers={"X-Linked-Size": "11"}, redirect=True))
+
+        def fake_http_get(url: str, temp_file: Any, **kwargs: Any) -> None:
+            temp_file.write(b"hello world")
+
+        dst = tmp_path / "out.parquet"
+        with patch("huggingface_hub.file_download.http_get", side_effect=fake_http_get):
+            HFBackend().download(f"{FROZEN_ORIGINAL}/{self._NAME}", str(dst))
+        assert dst.read_bytes() == b"hello world"
+        assert fs.fetched == []
+
+    def test_info_error_falls_back_to_http_get(
+        self, http: _FakeHTTP, tmp_path: Path
+    ) -> None:
+        fs = _FakeHfFileSystem({})
+
+        def broken_info(rpath: str) -> dict[str, Any]:
+            raise OSError("listing failed")
+
+        fs.info = broken_info  # type: ignore[method-assign]
         self._use_fs(fs)
         url = f"{_RESOLVE}/{SOURCE}/data/a.parquet"
         http.on("HEAD", url, _Resp(302, headers={"X-Linked-Size": "11"}, redirect=True))
@@ -697,6 +767,8 @@ class TestXetDownload:
     [
         ("0.36.0", False, False),
         ("2.0.3", False, False),
+        ("2.1.0.dev0", False, False),
+        ("2.1.0rc1", False, False),
         ("2.1.0", False, True),
         ("2.3.0.dev0", False, True),
         ("2.3.0", True, False),
@@ -708,12 +780,27 @@ def test_xet_downloads_need_hub_2_1_and_hf_xet(
     import huggingface_hub
     from huggingface_hub import constants
 
-    pytest.importorskip("hf_xet")
     monkeypatch.setattr(huggingface_hub, "__version__", version)
     monkeypatch.setattr(constants, "HF_HUB_DISABLE_XET", xet_disabled)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a: object())
     _real_xet_downloads_supported.cache_clear()
     try:
         assert _real_xet_downloads_supported() is expected
+    finally:
+        _real_xet_downloads_supported.cache_clear()
+
+
+@requires_hf_hub
+def test_xet_downloads_need_hf_xet_installed(monkeypatch: pytest.MonkeyPatch) -> None:
+    import huggingface_hub
+    from huggingface_hub import constants
+
+    monkeypatch.setattr(huggingface_hub, "__version__", "2.3.0")
+    monkeypatch.setattr(constants, "HF_HUB_DISABLE_XET", False)
+    monkeypatch.setattr(importlib.util, "find_spec", lambda name, *a: None)
+    _real_xet_downloads_supported.cache_clear()
+    try:
+        assert _real_xet_downloads_supported() is False
     finally:
         _real_xet_downloads_supported.cache_clear()
 
