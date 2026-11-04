@@ -27,6 +27,7 @@ from zephon._internal.io.catalog.handle import (
     attach,
     clear_registry,
     finalize,
+    node_shared_counts,
     resolve_catalog_dir,
     set_catalog_dir,
 )
@@ -47,6 +48,7 @@ __all__ = [
     "build_catalog",
     "clear_registry",
     "finalize",
+    "node_shared_counts",
     "get_extra_codec",
     "register_extra_codec",
     "resolve_catalog_dir",

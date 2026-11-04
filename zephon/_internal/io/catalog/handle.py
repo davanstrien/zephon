@@ -13,16 +13,19 @@ the rebuild serialized on the same source-key lock).
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import logging
 import os
 import tempfile
 import threading
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import numpy as np
 from filelock import FileLock
 
 from zephon._internal.io.catalog import io as catalog_io
@@ -359,6 +362,71 @@ def attach(handle: ShardCatalogHandle) -> ShardCatalog:
     return _load_and_register(handle.fingerprint)
 
 
+def node_shared_counts(
+    fmt: str, root: str, compute: Callable[[], tuple[np.ndarray, np.ndarray]]
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``compute()``'s shard counts, computed once per node for ``root``.
+
+    The first process on the node runs ``compute`` under a per-root file lock
+    and writes the result into the catalog directory. The other processes wait
+    for the lock and read that file, so a node scans the root once, and later
+    runs on the node don't scan it at all.
+
+    The file has no freshness check: use this only for a root whose content
+    cannot change, such as an ``hf://`` URI pinned to a commit. If the catalog
+    directory cannot be written, each process runs ``compute`` itself.
+    """
+    key = hashlib.sha256(f"{SCHEMA_VERSION}|{fmt}|{root}".encode()).hexdigest()
+    counts_dir = _schema_dir(_catalog_dir()) / ".counts"
+    path = counts_dir / f"{key}.npz"
+    try:
+        counts_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.debug("Not sharing shard counts for %s: %s", root, exc)
+        return compute()
+    with FileLock(str(counts_dir / f"{key}.lock")):
+        cached = _read_counts(path)
+        if cached is not None:
+            return cached
+        ids, counts = compute()
+        _write_counts(path, ids, counts)
+        return ids, counts
+
+
+def _read_counts(path: Path) -> tuple[np.ndarray, np.ndarray] | None:
+    """Load ``(ids, counts)`` written by ``_write_counts``, or ``None``."""
+    try:
+        with np.load(path, allow_pickle=False) as data:
+            ids = np.asarray(data["ids"], dtype=np.int64)
+            counts = np.asarray(data["counts"], dtype=np.int64)
+    except FileNotFoundError:
+        return None
+    except Exception as exc:  # a truncated or foreign file: recompute it
+        logger.warning("Ignoring unreadable shard counts file %s: %s", path, exc)
+        return None
+    if ids.shape != counts.shape or ids.ndim != 1:
+        logger.warning("Ignoring malformed shard counts file %s", path)
+        return None
+    return ids, counts
+
+
+def _write_counts(path: Path, ids: np.ndarray, counts: np.ndarray) -> None:
+    """Write ``(ids, counts)`` to ``path`` atomically; log and continue on error."""
+    tmp: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent, prefix=path.name, suffix=".tmp", delete=False
+        ) as fh:
+            tmp = fh.name
+            np.savez(fh, ids=ids, counts=counts)
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.warning("Could not write shard counts file %s: %s", path, exc)
+        if tmp is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(tmp)
+
+
 def clear_registry() -> None:
     """Drop all in-process mmapped catalogs (tests/teardown)."""
     with _REGISTRY_LOCK:
@@ -373,6 +441,7 @@ __all__ = [
     "attach",
     "clear_registry",
     "finalize",
+    "node_shared_counts",
     "resolve_catalog_dir",
     "set_catalog_dir",
 ]

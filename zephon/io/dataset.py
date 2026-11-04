@@ -16,6 +16,9 @@ from zephon._internal.io.catalog import (
 from zephon._internal.io.catalog import (
     ShardCatalogHandle as _ShardCatalogHandle,
 )
+from zephon._internal.io.catalog import (
+    node_shared_counts as _node_shared_counts,
+)
 from zephon._internal.io.formats import (
     ensure_builtin_formats as _ensure_builtin_formats,
 )
@@ -40,6 +43,8 @@ from zephon._internal.io.storage import (
 from zephon._internal.io.storage import (
     StorageBackend as _StorageBackend,
 )
+from zephon._internal.io.storage._hf_uri import HF_URI_SCHEME as _HF_URI_SCHEME
+from zephon._internal.io.storage._hf_uri import parse_hf_uri as _parse_hf_uri
 from zephon._internal.io.suffixes import JSONL_SUFFIXES as _JSONL_SUFFIXES
 from zephon._internal.io.suffixes import detect_format as _detect_format
 from zephon.io.memory import InMemoryShard
@@ -278,9 +283,28 @@ def _discover_counts(
     path; the protocol default runs the full ``discover()`` and keeps only the
     counts, so the heavy graph is at most transiently built, never retained.
     Results are normalized to ``int64`` arrays.
+
+    For a root whose content is fixed (an ``hf://`` URI pinned to a commit),
+    one process per node discovers the counts and the others read its result.
     """
-    ids, counts = handler.discover_counts(path, storage)
-    return np.asarray(ids, dtype=np.int64), np.asarray(counts, dtype=np.int64)
+
+    def compute() -> tuple[np.ndarray, np.ndarray]:
+        ids, counts = handler.discover_counts(path, storage)
+        return np.asarray(ids, dtype=np.int64), np.asarray(counts, dtype=np.int64)
+
+    if _is_pinned_hf_root(path):
+        return _node_shared_counts(handler.kind, path, compute)
+    return compute()
+
+
+def _is_pinned_hf_root(path: str) -> bool:
+    """Whether ``path`` is an ``hf://`` root pinned to a commit, source and config."""
+    if not path.startswith(_HF_URI_SCHEME):
+        return False
+    try:
+        return _parse_hf_uri(path).is_frozen
+    except ValueError:
+        return False
 
 
 __all__ = ["Dataset"]
