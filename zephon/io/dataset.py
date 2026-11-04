@@ -233,14 +233,14 @@ class Dataset:
         _ensure_builtin_formats(required={kind})
         handler = _get_format(kind)
         root_str = handler.resolve_root(root_str, storage)
-        ids, counts = _discover_counts(handler, root_str, storage)
+        header = _DatasetHeader(name=name, root=root_str, format=kind, path=root_str)
+        ids, counts = _discover_counts(handler, header, storage)
         # ids()/counts() hand these arrays out shared (the work-source cursor
         # gathers from them in place); freeze them so an in-place edit fails loud.
         ids.setflags(write=False)
         counts.setflags(write=False)
 
         backend = {"kind": kind, "path": root_str}
-        header = _DatasetHeader(name=name, root=root_str, format=kind, path=root_str)
         handle = _ShardCatalogHandle(dataset=header)
         dataset = cls(
             name=name,
@@ -275,7 +275,7 @@ def _inmem_ids_counts(
 
 
 def _discover_counts(
-    handler: _FormatHandler, path: str, storage: _StorageBackend
+    handler: _FormatHandler, header: _DatasetHeader, storage: _StorageBackend
 ) -> tuple[np.ndarray, np.ndarray]:
     """Obtain ``(ids, counts)`` without materializing per-shard ``shard_meta``.
 
@@ -284,16 +284,16 @@ def _discover_counts(
     counts, so the heavy graph is at most transiently built, never retained.
     Results are normalized to ``int64`` arrays.
 
-    For a root whose content is fixed (an ``hf://`` URI pinned to a commit),
-    one process per node discovers the counts and the others read its result.
+    For an ``hf://`` root pinned to a commit, one process per catalog directory
+    discovers the counts and the others read its result.
     """
 
     def compute() -> tuple[np.ndarray, np.ndarray]:
-        ids, counts = handler.discover_counts(path, storage)
+        ids, counts = handler.discover_counts(header.root, storage)
         return np.asarray(ids, dtype=np.int64), np.asarray(counts, dtype=np.int64)
 
-    if _is_pinned_hf_root(path):
-        return _node_shared_counts(handler.kind, path, compute)
+    if _is_pinned_hf_root(header.root):
+        return _node_shared_counts(header, compute)
     return compute()
 
 

@@ -46,6 +46,10 @@ logger = logging.getLogger(__name__)
 # cache's session lifecycle.
 CATALOG_CACHE_SUBDIR = ".catalog"
 
+# Suffix of the shard counts file written next to a source key's pointer;
+# bump the version if its layout changes.
+_COUNTS_SUFFIX = ".counts-v1.npz"
+
 # Module globals. Never pickled.
 _REGISTRY: dict[tuple[int, str], ShardCatalog] = {}
 _REGISTRY_LOCK = threading.Lock()
@@ -363,51 +367,72 @@ def attach(handle: ShardCatalogHandle) -> ShardCatalog:
 
 
 def node_shared_counts(
-    fmt: str, root: str, compute: Callable[[], tuple[np.ndarray, np.ndarray]]
+    header: DatasetHeader, compute: Callable[[], tuple[np.ndarray, np.ndarray]]
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Return ``compute()``'s shard counts, computed once per node for ``root``.
+    """Return ``compute()``'s shard counts, computed once per catalog directory.
 
-    The first process on the node runs ``compute`` under a per-root file lock
-    and writes the result into the catalog directory. The other processes wait
-    for the lock and read that file, so a node scans the root once, and later
-    runs on the node don't scan it at all.
+    The first process runs ``compute`` under the source-key lock that the
+    catalog build uses, and writes the result next to the catalog pointer. The
+    other processes on the node wait for the lock and read that file, and so
+    do later runs, so the root is scanned once instead of once per process.
 
-    The file has no freshness check: use this only for a root whose content
-    cannot change, such as an ``hf://`` URI pinned to a commit. If the catalog
-    directory cannot be written, each process runs ``compute`` itself.
+    The file is keyed on the catalog's source key, which folds in the file
+    listing, so a different listing gets a new file. Nothing checks the files'
+    contents, so use this only for a root whose files cannot change in place,
+    such as an ``hf://`` URI pinned to a commit. If the lock or the file can't
+    be used, the process runs ``compute`` itself.
     """
-    key = hashlib.sha256(f"{SCHEMA_VERSION}|{fmt}|{root}".encode()).hexdigest()
-    counts_dir = _schema_dir(_catalog_dir()) / ".counts"
-    path = counts_dir / f"{key}.npz"
+    skey = _source_key(header)
+    bykey = _schema_dir(_catalog_dir()) / ".bykey"
+    path = bykey / f"{skey}{_COUNTS_SUFFIX}"
+    lock = FileLock(str(bykey / f"{skey}.lock"))
     try:
-        counts_dir.mkdir(parents=True, exist_ok=True)
+        bykey.mkdir(parents=True, exist_ok=True)
+        lock.acquire()
     except OSError as exc:
-        logger.debug("Not sharing shard counts for %s: %s", root, exc)
+        logger.debug("Not sharing shard counts for %s: %s", header.root, exc)
         return compute()
-    with FileLock(str(counts_dir / f"{key}.lock")):
+    try:
         cached = _read_counts(path)
         if cached is not None:
             return cached
         ids, counts = compute()
         _write_counts(path, ids, counts)
         return ids, counts
+    finally:
+        lock.release()
 
 
 def _read_counts(path: Path) -> tuple[np.ndarray, np.ndarray] | None:
-    """Load ``(ids, counts)`` written by ``_write_counts``, or ``None``."""
+    """Load ``(ids, counts)`` written by ``_write_counts``, or ``None``.
+
+    A missing, unreadable or malformed file returns ``None``, so the caller
+    recomputes the counts and replaces it.
+    """
     try:
         with np.load(path, allow_pickle=False) as data:
-            ids = np.asarray(data["ids"], dtype=np.int64)
-            counts = np.asarray(data["counts"], dtype=np.int64)
+            ids = data["ids"]
+            counts = data["counts"]
     except FileNotFoundError:
         return None
-    except Exception as exc:  # a truncated or foreign file: recompute it
+    except Exception as exc:  # a truncated or foreign file
         logger.warning("Ignoring unreadable shard counts file %s: %s", path, exc)
         return None
-    if ids.shape != counts.shape or ids.ndim != 1:
+    if not _valid_counts(ids, counts):
         logger.warning("Ignoring malformed shard counts file %s", path)
         return None
-    return ids, counts
+    return ids.astype(np.int64, copy=False), counts.astype(np.int64, copy=False)
+
+
+def _valid_counts(ids: np.ndarray, counts: np.ndarray) -> bool:
+    """Whether ``ids`` are sorted unique integers and ``counts`` match them."""
+    if ids.ndim != 1 or ids.shape != counts.shape:
+        return False
+    if ids.dtype.kind not in "iu" or counts.dtype.kind not in "iu":
+        return False
+    if ids.size == 0:
+        return True
+    return bool(np.all(np.diff(ids) > 0) and counts.min() >= 0)
 
 
 def _write_counts(path: Path, ids: np.ndarray, counts: np.ndarray) -> None:
