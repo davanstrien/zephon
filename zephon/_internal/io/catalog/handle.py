@@ -213,12 +213,14 @@ def _schema_dir(base: Path) -> Path:
     return base / f"v{SCHEMA_VERSION}"
 
 
-def _source_sig(header: DatasetHeader) -> str:
+def _source_sig(header: DatasetHeader, *, strict: bool = False) -> str:
     """Cheap freshness signature of the discovery inputs (across-run safety net).
 
     Datasets are assumed immutable during a run; this only protects against a
     dataset changed in place under the same root between runs (a new sig yields a
     new source key -> pointer miss -> rebuild, so a stale catalog is not served).
+    By default a failed listing or ``stat`` is left out of the signature;
+    ``strict=True`` raises instead.
     """
     # Go through the storage backend (not raw Path), so remote roots (s3://,
     # gs://) are covered too: stat returns {size, mtime} for local and obstore
@@ -251,17 +253,25 @@ def _source_sig(header: DatasetHeader) -> str:
                     st = storage.stat(os.path.join(header.root, name))
                     parts.append(f"{name}:{st.get('size', '')}")
                 except Exception:
+                    if strict:
+                        raise
                     parts.append(name)
     except Exception:
-        pass
+        if strict:
+            raise
     return hashlib.sha256("|".join(str(p) for p in parts).encode("utf-8")).hexdigest()[
         :16
     ]
 
 
-def _source_key(header: DatasetHeader) -> str:
+def _source_key(header: DatasetHeader, *, strict: bool = False) -> str:
     raw = "|".join(
-        [str(SCHEMA_VERSION), header.format, header.root, _source_sig(header)]
+        [
+            str(SCHEMA_VERSION),
+            header.format,
+            header.root,
+            _source_sig(header, strict=strict),
+        ]
     )
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
@@ -379,10 +389,14 @@ def node_shared_counts(
     The file is keyed on the catalog's source key, which folds in the file
     listing, so a different listing gets a new file. Nothing checks the files'
     contents, so use this only for a root whose files cannot change in place,
-    such as an ``hf://`` URI pinned to a commit. If the lock or the file can't
-    be used, the process runs ``compute`` itself.
+    such as an ``hf://`` URI pinned to a commit. If the listing behind the key,
+    the lock or the file can't be used, the process runs ``compute`` itself.
     """
-    skey = _source_key(header)
+    try:
+        skey = _source_key(header, strict=True)
+    except Exception as exc:
+        logger.debug("Not sharing shard counts for %s: %s", header.root, exc)
+        return compute()
     bykey = _schema_dir(_catalog_dir()) / ".bykey"
     path = bykey / f"{skey}{_COUNTS_SUFFIX}"
     lock = FileLock(str(bykey / f"{skey}.lock"))
@@ -421,18 +435,18 @@ def _read_counts(path: Path) -> tuple[np.ndarray, np.ndarray] | None:
     if not _valid_counts(ids, counts):
         logger.warning("Ignoring malformed shard counts file %s", path)
         return None
-    return ids.astype(np.int64, copy=False), counts.astype(np.int64, copy=False)
+    return ids, counts
 
 
 def _valid_counts(ids: np.ndarray, counts: np.ndarray) -> bool:
-    """Whether ``ids`` are sorted unique integers and ``counts`` match them."""
-    if ids.ndim != 1 or ids.shape != counts.shape:
+    """Whether ``ids`` are sorted unique int64s and ``counts`` match them."""
+    if ids.dtype != np.int64 or counts.dtype != np.int64:
         return False
-    if ids.dtype.kind not in "iu" or counts.dtype.kind not in "iu":
+    if ids.ndim != 1 or ids.shape != counts.shape:
         return False
     if ids.size == 0:
         return True
-    return bool(np.all(np.diff(ids) > 0) and counts.min() >= 0)
+    return bool(np.all(ids[1:] > ids[:-1]) and counts.min() >= 0)
 
 
 def _write_counts(path: Path, ids: np.ndarray, counts: np.ndarray) -> None:
@@ -443,7 +457,11 @@ def _write_counts(path: Path, ids: np.ndarray, counts: np.ndarray) -> None:
             dir=path.parent, prefix=path.name, suffix=".tmp", delete=False
         ) as fh:
             tmp = fh.name
-            np.savez(fh, ids=ids, counts=counts)
+            np.savez(
+                fh,
+                ids=np.asarray(ids, dtype=np.int64),
+                counts=np.asarray(counts, dtype=np.int64),
+            )
         os.replace(tmp, path)
     except OSError as exc:
         logger.warning("Could not write shard counts file %s: %s", path, exc)

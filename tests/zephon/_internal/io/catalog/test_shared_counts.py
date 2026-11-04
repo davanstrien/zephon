@@ -106,6 +106,9 @@ def test_unreadable_file_is_recomputed(
         (np.array([0, 1]), np.array([3, -1])),  # negative count
         (np.array([0, 1]), np.array([3])),  # length mismatch
         (np.array([[0, 1]]), np.array([[3, 4]])),  # not 1-D
+        (np.array([1, 0], dtype=np.uint64), np.array([3, 4])),  # wraps in np.diff
+        (np.array([0, 1]), np.array([3, 2**63], dtype=np.uint64)),  # int64 overflow
+        (np.array([0, 1], dtype=np.int32), np.array([3, 4], dtype=np.int32)),
     ],
 )
 def test_malformed_file_is_recomputed(
@@ -122,6 +125,25 @@ def test_malformed_file_is_recomputed(
 
     assert len(calls) == 2
     assert got.tolist() == [3, 4]
+
+
+def test_failed_listing_does_not_share(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A key without the listing could serve stale counts, so skip the file."""
+    from zephon._internal.io.storage import RouterStorageBackend
+
+    def failing_listdir(self: object, path: str) -> list[str]:
+        raise OSError("listing failed")
+
+    monkeypatch.setattr(RouterStorageBackend, "listdir", failing_listdir)
+    header = _header(_root(tmp_path))
+    compute, calls = _counting([0], [9])
+
+    for _ in range(2):
+        assert node_shared_counts(header, compute)[1].tolist() == [9]
+    assert len(calls) == 2
+    assert _counts_files() == []
 
 
 def test_failed_compute_releases_the_lock_and_writes_nothing(tmp_path: Path) -> None:
